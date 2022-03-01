@@ -47,6 +47,7 @@
 #include <linux/pkeys.h>
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
+#include <linux/pagewalk.h>
 
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
@@ -274,6 +275,9 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 
 success:
 	populate = newbrk > oldbrk && (mm->def_flags & VM_LOCKED) != 0;
+	if (mm->flags & MMF_USE_ODF_MASK) {
+		populate = true;
+	}
 	if (downgraded)
 		mmap_read_unlock(mm);
 	else
@@ -1112,6 +1116,48 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 	return 0;
 }
 
+static int pgtable_counter_fixup_pmd_entry(pmd_t *pmd, unsigned long addr,
+			       unsigned long next, struct mm_walk *walk)
+{
+	struct page *table_page;
+
+	table_page = pmd_page(*pmd);
+	atomic64_inc(&(table_page->pte_table_refcount));
+
+	walk->action = ACTION_CONTINUE;  //skip pte level
+	return 0;
+}
+
+static int pgtable_counter_fixup_test(unsigned long addr, unsigned long next,
+			  struct mm_walk *walk)
+{
+	return 0;
+}
+
+static const struct mm_walk_ops pgtable_counter_fixup_walk_ops = {
+	.pmd_entry = pgtable_counter_fixup_pmd_entry,
+	.test_walk = pgtable_counter_fixup_test
+};
+
+int merge_vma_pgtable_counter_fixup(struct vm_area_struct *vma,
+			  unsigned long start, unsigned long end)
+{
+	if (vma->pte_table_counter_pending) {
+		return 0;
+	} else {
+		start = pte_table_end(start);
+		end = pte_table_start(end);
+		/* popuate tables for extended address range
+		 * so that we can increment counters
+		 */
+		__mm_populate_nolock(start, end-start, 1);
+		walk_page_range(vma->vm_mm, start, end,
+				&pgtable_counter_fixup_walk_ops, NULL);
+	}
+
+	return 0;
+}
+
 /*
  * Given a mapping request (addr,end,vm_flags,file,pgoff), figure out
  * whether that can be merged with its predecessor or its successor.
@@ -1212,6 +1258,7 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
 		if (err)
 			return NULL;
 		khugepaged_enter_vma_merge(prev, vm_flags);
+		merge_vma_pgtable_counter_fixup(prev, addr, end);
 		return prev;
 	}
 
@@ -1239,6 +1286,7 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
 		if (err)
 			return NULL;
 		khugepaged_enter_vma_merge(area, vm_flags);
+		merge_vma_pgtable_counter_fixup(area, addr, end);
 		return area;
 	}
 
@@ -1575,7 +1623,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
 	if (!IS_ERR_VALUE(addr) &&
 	    ((vm_flags & VM_LOCKED) ||
-	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
++	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE ||
++	     (mm->flags & MMF_USE_ODF_MASK)))
 		*populate = len;
 	return addr;
 }
@@ -2772,6 +2821,35 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	return __split_vma(mm, vma, addr, new_below);
 }
 
+/* left and right vma after the split, address of split */
+int split_vma_pgtable_counter_fixup(struct vm_area_struct *lvma, struct vm_area_struct *rvma, bool orig_pending_flag)
+{
+
+	if (orig_pending_flag) {
+		/* the new vma will have pending flag as
+		 * true by default, just as the old vma
+		 */
+		return 0;
+	} else {
+		lvma->pte_table_counter_pending = false;
+		rvma->pte_table_counter_pending = false;
+
+		 // the split was right at the pte table boundary
+		if (pte_table_start(rvma->vm_start) == rvma->vm_start)
+			/* the only case where we don't
+			 * increment pte table counter
+			 */
+			return 0;
+		else
+			walk_page_range(rvma->vm_mm,
+					pte_table_start(rvma->vm_start),
+					pte_table_end(rvma->vm_start),
+					&pgtable_counter_fixup_walk_ops, NULL);
+	}
+
+	return 0;
+}
+
 static inline void
 unlock_range(struct vm_area_struct *start, unsigned long limit)
 {
@@ -2842,6 +2920,8 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 		if (error)
 			return error;
 		prev = vma;
+		split_vma_pgtable_counter_fixup(prev, prev->vm_next,
+					prev->pte_table_counter_pending);
 	}
 
 	/* Does it split the last one? */
@@ -2850,6 +2930,8 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 		int error = __split_vma(mm, last, end, 1);
 		if (error)
 			return error;
+		split_vma_pgtable_counter_fixup(last->vm_prev, last,
+					last->pte_table_counter_pending);
 	}
 	vma = vma_next(mm, prev);
 
